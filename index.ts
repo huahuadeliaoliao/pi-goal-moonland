@@ -393,7 +393,13 @@ export default function goalMode(pi: ExtensionAPI): void {
 
 	// Restore state on start/resume; an active goal always comes back paused.
 	pi.on("session_start", async (event, ctx) => {
-		const entries = ctx.sessionManager.getEntries();
+		// Lazy-engine fast path: metadata-level type filter when available
+		// (full-scan fallback keeps stock-pi compatibility).
+		const allEntries = ctx.sessionManager.getEntries();
+		const entries =
+			(ctx.sessionManager as unknown as { getEntriesByType?: (type: string) => typeof allEntries }).getEntriesByType?.(
+				"custom",
+			) ?? allEntries.filter((e) => e.type === "custom");
 		const stateEntry = entries
 			.filter((e) => e.type === "custom" && (e as { customType?: string }).customType === STATE_ENTRY_TYPE)
 			.pop() as { data?: GoalState | null } | undefined;
