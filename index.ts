@@ -393,13 +393,15 @@ export default function goalMode(pi: ExtensionAPI): void {
 
 	// Restore state on start/resume; an active goal always comes back paused.
 	pi.on("session_start", async (event, ctx) => {
-		// Lazy-engine fast path: metadata-level type filter when available
-		// (full-scan fallback keeps stock-pi compatibility).
-		const allEntries = ctx.sessionManager.getEntries();
-		const entries =
-			(ctx.sessionManager as unknown as { getEntriesByType?: (type: string) => typeof allEntries }).getEntriesByType?.(
-				"custom",
-			) ?? allEntries.filter((e) => e.type === "custom");
+		// Lazy-engine fast path: metadata-level type filter when available.
+		// Check method EXISTENCE first — calling getEntries() eagerly for the
+		// fallback would defeat the whole point (full materialization).
+		const pagedSM = ctx.sessionManager as unknown as {
+			getEntriesByType?: (type: string) => ReturnType<typeof ctx.sessionManager.getEntries>;
+		};
+		const entries = pagedSM.getEntriesByType
+			? pagedSM.getEntriesByType("custom")
+			: ctx.sessionManager.getEntries().filter((e) => e.type === "custom");
 		const stateEntry = entries
 			.filter((e) => e.type === "custom" && (e as { customType?: string }).customType === STATE_ENTRY_TYPE)
 			.pop() as { data?: GoalState | null } | undefined;
