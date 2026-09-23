@@ -6,6 +6,7 @@ import {
 	buildCompleteOutcome,
 	buildContinuationPrompt,
 	buildInactiveNote,
+	buildProgressPing,
 } from "../prompts.ts";
 import { createGoalState } from "../state.ts";
 
@@ -18,21 +19,32 @@ test("the objective is wrapped as untrusted data and HTML-escaped", () => {
 	assert.ok(text.includes("&amp; co"));
 });
 
-test("the active reminder carries status, turn count and the audit language", () => {
+test("the active reminder carries status and the audit language — and is byte-stable across turn counts", () => {
 	const goal = { ...createGoalState("fix the failing tests"), turnsUsed: 7 };
 	const text = buildActiveReminder(goal);
 	assert.ok(text.includes("Status: active"));
-	assert.ok(text.includes("Goal turns so far: 7"));
 	assert.ok(text.includes("Completion audit"));
 	assert.ok(text.includes("Blocked audit"));
+	// Cache contract: no per-turn data in the per-call reminder.
+	assert.ok(!text.includes("Goal turns so far"));
+	assert.equal(text, buildActiveReminder({ ...goal, turnsUsed: 999 }), "reminder must not vary with turnsUsed");
+	assert.equal(text, buildActiveReminder({ ...goal, updatedAt: Date.now() }), "reminder must not vary with timestamps");
 });
 
-test("the continuation prompt carries objective and turn count", () => {
-	const goal = { ...createGoalState("keep going"), turnsUsed: 3 };
-	const text = buildContinuationPrompt(goal);
+test("the continuation prompt is fully static", () => {
+	const text = buildContinuationPrompt();
 	assert.ok(text.includes("Continue working toward the active goal"));
-	assert.ok(text.includes("keep going"));
-	assert.ok(text.includes("Goal turns so far: 3"));
+	assert.ok(text.includes("Completion audit"));
+	assert.equal(text, buildContinuationPrompt(), "continuation must be constant");
+});
+
+test("the progress ping carries the objective and the live turn count", () => {
+	const goal = { ...createGoalState("keep going <fast>"), turnsUsed: 12 };
+	const text = buildProgressPing(goal);
+	assert.ok(text.includes("12 goal turns so far"));
+	assert.ok(text.includes("&lt;fast&gt;"), "the objective must be escaped");
+	assert.ok(text.includes('goal tool (op "get")'));
+	assert.notEqual(text, buildProgressPing({ ...goal, turnsUsed: 13 }), "pings are persistent: live data is fine here");
 });
 
 test("the inactive note escapes the reason and points at /goal resume", () => {

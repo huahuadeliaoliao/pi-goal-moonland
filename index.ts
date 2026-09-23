@@ -8,7 +8,11 @@
  *   across runs until the model marks the goal complete/blocked via the tool.
  * - Goal state lives in custom session entries (outside LLM context), so
  *   compaction cannot touch it. The objective is re-injected before every LLM
- *   call via the `context` event, so compaction cannot lose it either.
+ *   call via the `context` event, so compaction cannot lose it either. The
+ *   injected reminder is a pure function of (objective, status) and sits at
+ *   the head of the visible messages, keeping the provider's prompt-cache
+ *   prefix stable across calls; live progress rides on periodic persistent
+ *   pings appended at turn boundaries (cache-neutral).
  * - Interrupt (Esc) pauses the goal; resuming a session restores an active
  *   goal as paused. Errors pause via the agent_settled safety net.
  *
@@ -34,12 +38,15 @@ import {
 	buildCompleteOutcome,
 	buildContinuationPrompt,
 	buildInactiveNote,
+	buildProgressPing,
 } from "./prompts.ts";
 import { createGoalState, type GoalState, isLiveGoal, validateObjective } from "./state.ts";
 
 const CONTINUATION_TYPE = "goal-continuation";
+const PROGRESS_PING_TYPE = "goal-progress";
 const STATE_ENTRY_TYPE = "goal-state";
 const EVENT_ENTRY_TYPE = "goal-event";
+const DEFAULT_PROGRESS_INTERVAL = 20;
 
 type GoalEventKind = "created" | "resumed" | "paused" | "cancelled" | "complete" | "blocked";
 
@@ -51,6 +58,15 @@ function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
 
 export default function goalMode(pi: ExtensionAPI): void {
 	let goal: GoalState | null = null;
+	// When set, the next turn_end appends a progress ping regardless of cadence
+	// (armed by session_compact: compaction may have dropped earlier pings).
+	let pingArmed = false;
+
+	function progressInterval(): number {
+		const raw = pi.getFlag("goal-progress-interval");
+		const parsed = typeof raw === "string" ? Number.parseInt(raw, 10) : Number.NaN;
+		return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_PROGRESS_INTERVAL;
+	}
 
 	// ------------------------------------------------------------- state core
 
@@ -108,6 +124,11 @@ export default function goalMode(pi: ExtensionAPI): void {
 		description: "Ask for user confirmation when the agent creates a goal",
 		type: "boolean",
 		default: false,
+	});
+
+	pi.registerFlag("goal-progress-interval", {
+		description: "Append a persistent goal-progress message every N goal turns (0 disables)",
+		type: "string",
 	});
 
 	// ------------------------------------------------------------ run control
@@ -182,7 +203,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 					}
 					setGoal({ ...goal, status: "active", reason: undefined }, ctx, "resumed");
 					ctx.ui.notify("Goal resumed.", "info");
-					if (ctx.isIdle()) await kick(buildContinuationPrompt(goal), ctx);
+					if (ctx.isIdle()) await kick(buildContinuationPrompt(), ctx);
 					return;
 				}
 				if (sub === "cancel") {
@@ -313,23 +334,21 @@ export default function goalMode(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ hooks
 
-	// Per-LLM-call injection (compaction-safe) + stale continuation cleanup.
+	// Per-LLM-call injection (compaction-safe). Cache contract: the reminder is
+	// a pure function of (objective, status[, reason]) and goes to the HEAD of
+	// the visible messages, so consecutive requests share a stable prefix and
+	// provider prompt caching (and codex response chaining) keep working.
+	// Per-turn data must NEVER go into this message — it rides the persistent
+	// progress pings appended at turn boundaries instead (see turn_end below).
 	pi.on("context", async (event) => {
-		const messages = event.messages.filter((m, i) => {
-			const msg = m as AgentMessage & { customType?: string };
-			if (msg.role !== "custom" || msg.customType !== CONTINUATION_TYPE) return true;
-			// Keep only the LAST goal-continuation message.
-			return !event.messages.slice(i + 1).some((n) => (n as { customType?: string }).customType === CONTINUATION_TYPE);
-		});
-		if (goal && goal.status !== "complete") {
-			const content = goal.status === "active" ? buildActiveReminder(goal) : buildInactiveNote(goal);
-			messages.push({
-				role: "user",
-				content: [{ type: "text", text: content }],
-				timestamp: Date.now(),
-			} as AgentMessage);
-		}
-		return { messages };
+		if (!goal || goal.status === "complete") return;
+		const content = goal.status === "active" ? buildActiveReminder(goal) : buildInactiveNote(goal);
+		const reminder = {
+			role: "user",
+			content: [{ type: "text", text: content }],
+			timestamp: Date.now(),
+		} as AgentMessage;
+		return { messages: [reminder, ...event.messages] };
 	});
 
 	// Count goal turns (kimi semantics: a turn is a turn, whether it starts a
@@ -343,6 +362,22 @@ export default function goalMode(pi: ExtensionAPI): void {
 		if (goal?.status !== "active") return;
 		goal = { ...goal, turnsUsed: goal.turnsUsed + 1, updatedAt: Date.now() };
 		updateStatus(ctx);
+		// Periodic progress ping: a PERSISTENT tail-appended message, so it only
+		// ever extends the prompt prefix (cache-neutral). It carries the live
+		// counter and re-surfaces the objective near the tail in long runs. The
+		// send is queued mid-run and flushed by pi at this turn boundary — no
+		// extra model call, and turn counting is unaffected.
+		const interval = progressInterval();
+		if (pingArmed || (interval > 0 && goal.turnsUsed % interval === 0)) {
+			pingArmed = false;
+			pi.sendMessage({ customType: PROGRESS_PING_TYPE, content: buildProgressPing(goal), display: false });
+		}
+	});
+
+	// Compaction may summarize earlier pings away; re-arm so the next turn
+	// boundary re-surfaces the objective and counter near the tail.
+	pi.on("session_compact", async () => {
+		if (goal?.status === "active") pingArmed = true;
 	});
 
 	// The continuation loop: a run ended with the goal still active -> queue a
@@ -368,7 +403,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 			return;
 		}
 		pi.sendMessage(
-			{ customType: CONTINUATION_TYPE, content: buildContinuationPrompt(goal), display: false },
+			{ customType: CONTINUATION_TYPE, content: buildContinuationPrompt(), display: false },
 			{ deliverAs: "followUp" },
 		);
 	});
@@ -393,15 +428,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 
 	// Restore state on start/resume; an active goal always comes back paused.
 	pi.on("session_start", async (event, ctx) => {
-		// Lazy-engine fast path: metadata-level type filter when available.
-		// Check method EXISTENCE first — calling getEntries() eagerly for the
-		// fallback would defeat the whole point (full materialization).
-		const pagedSM = ctx.sessionManager as unknown as {
-			getEntriesByType?: (type: string) => ReturnType<typeof ctx.sessionManager.getEntries>;
-		};
-		const entries = pagedSM.getEntriesByType
-			? pagedSM.getEntriesByType("custom")
-			: ctx.sessionManager.getEntries().filter((e) => e.type === "custom");
+		const entries = ctx.sessionManager.getEntries().filter((e) => e.type === "custom");
 		const stateEntry = entries
 			.filter((e) => e.type === "custom" && (e as { customType?: string }).customType === STATE_ENTRY_TYPE)
 			.pop() as { data?: GoalState | null } | undefined;

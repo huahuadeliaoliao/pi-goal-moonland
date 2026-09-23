@@ -66,6 +66,8 @@ Flags:
 
 - `--goal "<objective>"` — start a TUI/RPC session with a goal already running
 - `--goal-confirm` — ask for your approval before an agent-created goal starts
+- `--goal-progress-interval <N>` — append a persistent goal-progress message every N
+  goal turns (default 20; 0 disables)
 
 Headless: `pi -p "/goal <objective>"` runs the goal to completion, then exits.
 
@@ -81,6 +83,12 @@ or simply want a human checkpoint, start pi with `--goal-confirm`.
 - **Compaction-proof** — goal state lives in session custom entries (never enters LLM
   context), and the objective is re-injected before every LLM call via the `context`
   event. Compaction summarizes the conversation; it cannot lose the goal.
+- **Prompt-cache friendly** — the injected reminder is a pure function of (objective,
+  status), placed at the head of the conversation so the provider's cache prefix stays
+  stable across calls. Live progress (turn count, objective refresh) rides on periodic
+  persistent `goal-progress` pings appended at turn boundaries — cache-neutral, and
+  re-armed after compaction. (An earlier version injected a per-turn counter at the
+  tail; it broke response chaining on every call and cost real money.)
 - **Honest endings** — the prompt wording (adapted from kimi-code's iterated audit
   language) pushes the agent to verify against current evidence before `complete`, and
   to only declare `blocked` after the same blocker repeats for 3 consecutive goal turns.
