@@ -9,10 +9,11 @@
  * - Goal state lives in custom session entries (outside LLM context), so
  *   compaction cannot touch it. The objective is re-injected before every LLM
  *   call via the `context` event, so compaction cannot lose it either. The
- *   injected reminder is a pure function of (objective, status) and sits at
- *   the head of the visible messages, keeping the provider's prompt-cache
- *   prefix stable across calls; live progress rides on periodic persistent
- *   pings appended at turn boundaries (cache-neutral).
+ *   injected reminder is a pure function of the objective (status-neutral on
+ *   purpose) and sits at the head of the visible messages, keeping the
+ *   provider's prompt-cache prefix stable across calls AND across goal
+ *   lifecycle transitions; live progress and status changes ride on
+ *   persistent messages appended at turn boundaries (cache-neutral).
  * - Interrupt (Esc) pauses the goal; resuming a session restores an active
  *   goal as paused. Errors pause via the agent_settled safety net.
  *
@@ -33,17 +34,19 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
-	buildActiveReminder,
 	buildBlockedOutcome,
+	buildCancelledNote,
 	buildCompleteOutcome,
 	buildContinuationPrompt,
-	buildInactiveNote,
+	buildGoalReminder,
+	buildPausedNote,
 	buildProgressPing,
 } from "./prompts.ts";
 import { createGoalState, type GoalState, isLiveGoal, validateObjective } from "./state.ts";
 
 const CONTINUATION_TYPE = "goal-continuation";
 const PROGRESS_PING_TYPE = "goal-progress";
+const STATUS_NOTE_TYPE = "goal-status";
 const STATE_ENTRY_TYPE = "goal-state";
 const EVENT_ENTRY_TYPE = "goal-event";
 const DEFAULT_PROGRESS_INTERVAL = 20;
@@ -93,10 +96,19 @@ export default function goalMode(pi: ExtensionAPI): void {
 	}
 
 	function setGoal(next: GoalState | null, ctx?: ExtensionContext, event?: GoalEventKind): void {
+		const prev = goal;
 		goal = next ? { ...next, updatedAt: Date.now() } : null;
 		persistState();
 		if (event) recordEvent(event, goal);
 		if (ctx) updateStatus(ctx);
+		// Persistent, append-only lifecycle notes (cache-neutral): the model's
+		// in-context signal for transitions that used to flip the ephemeral
+		// reminder's content (one full cache invalidation per flip before).
+		if (next?.status === "paused" && prev?.status !== "paused") {
+			pi.sendMessage({ customType: STATUS_NOTE_TYPE, content: buildPausedNote(next), display: false });
+		} else if (next === null && event === "cancelled") {
+			pi.sendMessage({ customType: STATUS_NOTE_TYPE, content: buildCancelledNote(), display: false });
+		}
 	}
 
 	function createGoal(objective: string, ctx?: ExtensionContext): GoalState {
@@ -335,17 +347,18 @@ export default function goalMode(pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------ hooks
 
 	// Per-LLM-call injection (compaction-safe). Cache contract: the reminder is
-	// a pure function of (objective, status[, reason]) and goes to the HEAD of
-	// the visible messages, so consecutive requests share a stable prefix and
-	// provider prompt caching (and codex response chaining) keep working.
-	// Per-turn data must NEVER go into this message — it rides the persistent
-	// progress pings appended at turn boundaries instead (see turn_end below).
+	// a pure function of the objective — status-neutral on purpose — and sits
+	// at the HEAD of the visible messages. It is injected whenever a goal
+	// record exists (active, paused, blocked, or complete), so lifecycle
+	// transitions no longer change a single byte: the prompt-cache prefix
+	// survives pause/resume/blocked/complete. Only creation, cancel, and
+	// replace alter it (one irreducible invalidation each, all user-initiated).
+	// Status signals ride persistent appended notes instead (see setGoal).
 	pi.on("context", async (event) => {
-		if (!goal || goal.status === "complete") return;
-		const content = goal.status === "active" ? buildActiveReminder(goal) : buildInactiveNote(goal);
+		if (!goal) return;
 		const reminder = {
 			role: "user",
-			content: [{ type: "text", text: content }],
+			content: [{ type: "text", text: buildGoalReminder(goal) }],
 			timestamp: Date.now(),
 		} as AgentMessage;
 		return { messages: [reminder, ...event.messages] };

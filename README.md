@@ -83,12 +83,15 @@ or simply want a human checkpoint, start pi with `--goal-confirm`.
 - **Compaction-proof** — goal state lives in session custom entries (never enters LLM
   context), and the objective is re-injected before every LLM call via the `context`
   event. Compaction summarizes the conversation; it cannot lose the goal.
-- **Prompt-cache friendly** — the injected reminder is a pure function of (objective,
-  status), placed at the head of the conversation so the provider's cache prefix stays
-  stable across calls. Live progress (turn count, objective refresh) rides on periodic
-  persistent `goal-progress` pings appended at turn boundaries — cache-neutral, and
-  re-armed after compaction. (An earlier version injected a per-turn counter at the
-  tail; it broke response chaining on every call and cost real money.)
+- **Prompt-cache friendly** — the injected reminder is a pure function of the
+  objective, placed at the head of the conversation and kept byte-identical across
+  the goal's whole lifecycle, so the provider's cache prefix survives calls AND
+  pause/resume/blocked/complete. Live progress (turn count, objective refresh)
+  rides on periodic persistent `goal-progress` pings; lifecycle changes append
+  persistent `goal-status` notes — both cache-neutral. Only creating, cancelling,
+  or replacing a goal can invalidate the cache (once each, user-initiated).
+  (An earlier version injected a per-turn counter at the tail; it broke response
+  chaining on every call and cost real money.)
 - **Honest endings** — the prompt wording (adapted from kimi-code's iterated audit
   language) pushes the agent to verify against current evidence before `complete`, and
   to only declare `blocked` after the same blocker repeats for 3 consecutive goal turns.

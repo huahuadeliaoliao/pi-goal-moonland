@@ -3,10 +3,10 @@
 ## Unreleased
 
 - **Prompt-cache friendly redesign** (fixes severe cache misses with goal active — a live session dropped from 88% to 8.5% cache-hit and burned 70M uncached input tokens):
-  - The per-call `context` reminder is now a pure function of (objective, status) — `Goal turns so far` removed — and is injected at the **head** of the visible messages instead of the tail, so consecutive requests keep a stable prefix (provider prompt caching and codex `previous_response_id` chaining work again).
+  - The per-call `context` reminder is now a pure function of the objective (status-neutral wording), injected at the **head** of the visible messages whenever a goal record exists — pause/resume/blocked/complete no longer change a single byte. Lifecycle transitions append persistent `goal-status` notes instead. Only create/cancel/replace can invalidate the cache (once each, user-initiated).
   - New periodic **progress ping**: a persistent, tail-appended `goal-progress` message every N goal turns (default 20, `--goal-progress-interval` to tune, 0 disables) carries the live turn count and re-surfaces the objective near the tail. Re-armed after compaction.
   - Continuation prompts are now fully static (no objective, no counters), so stale continuations stay in history unpruned — the `context` hook no longer removes anything mid-history.
-  - Tests pin the cache contracts: reminder byte-stability across turns, prefix-stability of the context output as history grows, ping cadence and compaction re-arm.
+  - Tests pin the cache contracts: reminder byte-stability across turns AND lifecycle transitions, prefix-stability of the context output as history grows, ping cadence and compaction re-arm.
 - Dropped the `getEntriesByType` feature-detection (pi-lazy-session fork API); state restore uses the stock `getEntries()` scan again.
 
 ## 0.1.0 (2026-09-16)

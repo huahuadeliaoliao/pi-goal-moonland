@@ -306,7 +306,14 @@ test("an interrupted run pauses the goal instead of continuing", async () => {
 	mock.sentMessages.length = 0;
 
 	await fireAsync(mock, "agent_end", endedRun("aborted"), mock.ctx);
-	assert.equal(mock.sentMessages.length, 0);
+	assert.equal(
+		mock.sentMessages.filter((m) => m.message.customType === "goal-continuation").length,
+		0,
+		"an interrupted run never queues a continuation",
+	);
+	const notes = mock.sentMessages.filter((m) => m.message.customType === "goal-status");
+	assert.equal(notes.length, 1, "the pause lands as a persistent status note");
+	assert.ok(String(notes[0].message.content).includes("paused after interruption"));
 	assert.equal(stateOf(mock).status, "paused");
 	assert.equal(stateOf(mock).reason, "paused after interruption");
 	assert.deepEqual(goalEvents(mock), ["created", "paused"]);
@@ -388,27 +395,29 @@ test("context injects the reminder at the HEAD and leaves history append-only", 
 	assert.equal(head.role, "user");
 	const text = messageText(head);
 	assert.ok(text.includes("fix tests"));
-	assert.ok(text.includes("active goal"));
+	assert.ok(text.includes("registered goal"));
 });
 
-test("context reminder is byte-stable across turns (prompt-cache contract)", async () => {
+test("context reminder is byte-stable across turns and lifecycle transitions (prompt-cache contract)", async () => {
 	const mock = setup();
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	const user = { role: "user", content: "hi", timestamp: 2 };
+	const headOf = async () =>
+		messageText(
+			((await fireAsync(mock, "context", { messages: [user] }, mock.ctx))[0] as { messages: any[] }).messages[0],
+		);
 
-	const head1 = messageText(
-		((await fireAsync(mock, "context", { messages: [user] }, mock.ctx))[0] as { messages: any[] }).messages[0],
-	);
+	const active = await headOf();
 	await fireAsync(mock, "turn_end", {}, mock.ctx);
 	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	const head2 = messageText(
-		(
-			(await fireAsync(mock, "context", { messages: [user, { role: "assistant", content: [] }] }, mock.ctx))[0] as {
-				messages: any[];
-			}
-		).messages[0],
-	);
-	assert.equal(head2, head1, "the injected reminder must not change as turns accrue");
+	assert.equal(await headOf(), active, "unchanged as turns accrue");
+
+	await mock.commands.get("goal")!.handler("pause", mock.ctx);
+	assert.equal(await headOf(), active, "unchanged by pause");
+	await mock.commands.get("goal")!.handler("resume", mock.ctx);
+	assert.equal(await headOf(), active, "unchanged by resume");
+	await mock.tools.get("goal")!.execute("t1", { op: "complete" }, undefined, undefined, mock.ctx);
+	assert.equal(await headOf(), active, "unchanged by completion");
 });
 
 test("context output is prefix-stable as history grows (response-chaining contract)", async () => {
@@ -463,7 +472,7 @@ test("session_compact arms an immediate progress ping on the next turn", async (
 	assert.equal(pings().length, 1, "the armed ping fires once");
 });
 
-test("context injects an inactive note for paused goals, nothing for absent or completed ones", async () => {
+test("context injects for any existing goal, opts out only when none exists", async () => {
 	const mock = setup();
 	let out = await fireAsync(mock, "context", { messages: [] }, mock.ctx);
 	assert.equal(out[0], undefined, "no goal: the handler opts out, messages unchanged");
@@ -471,16 +480,40 @@ test("context injects an inactive note for paused goals, nothing for absent or c
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	await mock.commands.get("goal")!.handler("pause", mock.ctx);
 	out = await fireAsync(mock, "context", { messages: [] }, mock.ctx);
-	const messages = (out[0] as { messages: any[] }).messages;
-	assert.equal(messages.length, 1);
-	assert.ok(messageText(messages[0]).includes("currently paused"));
-	assert.equal(messages[0].role, "user");
+	const paused = (out[0] as { messages: any[] }).messages;
+	assert.equal(paused.length, 1);
+	assert.ok(messageText(paused[0]).includes("fix tests"), "paused goal: the objective stays injected");
+	assert.ok(messageText(paused[0]).includes("registered goal"));
 
 	const done = setup();
 	await done.commands.get("goal")!.handler("fix tests", done.ctx);
 	await done.tools.get("goal")!.execute("t1", { op: "complete" }, undefined, undefined, done.ctx);
 	out = await fireAsync(done, "context", { messages: [] }, done.ctx);
-	assert.equal(out[0], undefined, "completed goal: the handler opts out, messages unchanged");
+	const completed = (out[0] as { messages: any[] }).messages;
+	assert.equal(completed.length, 1, "completed goal: injection continues, bytes unchanged");
+
+	await mock.commands.get("goal")!.handler("cancel", mock.ctx);
+	out = await fireAsync(mock, "context", { messages: [] }, mock.ctx);
+	assert.equal(out[0], undefined, "cancelled goal: the record is gone, no injection");
+});
+
+test("pause and cancel append persistent status notes", async () => {
+	const mock = setup();
+	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
+	const notes = () => mock.sentMessages.filter((m) => m.message.customType === "goal-status");
+
+	await mock.commands.get("goal")!.handler("pause", mock.ctx);
+	assert.equal(notes().length, 1, "pause appends one persistent note");
+	assert.ok(messageText(notes()[0].message).includes("paused"));
+
+	await mock.commands.get("goal")!.handler("resume", mock.ctx);
+	await mock.commands.get("goal")!.handler("pause", mock.ctx);
+	assert.equal(notes().length, 2, "each pause transition appends one note");
+
+	await mock.commands.get("goal")!.handler("resume", mock.ctx);
+	await mock.commands.get("goal")!.handler("cancel", mock.ctx);
+	const cancelNotes = notes().filter((m) => messageText(m.message).includes("cancelled"));
+	assert.equal(cancelNotes.length, 1, "cancel appends a cancelled note");
 });
 
 // ------------------------------------------------------------------ restore
