@@ -93,6 +93,8 @@ export interface MockCtxOptions {
 	/** Text returned by ctx.ui.editor for a bare /goal. Default: undefined (dismissed). */
 	editorText?: string;
 	storedEntries?: any[];
+	/** Entries on the current branch (defaults to storedEntries). Mutable via setBranch. */
+	branchEntries?: any[];
 }
 
 export interface MockCtx {
@@ -102,6 +104,8 @@ export interface MockCtx {
 	/** Every ctx.ui.confirm invocation, in order. Empty = the gate never fired. */
 	confirmCalls: Array<{ title: string; text: string }>;
 	isAborted: () => boolean;
+	/** Replace what sessionManager.getBranch() returns (simulates /tree navigation). */
+	setBranch: (entries: any[]) => void;
 }
 
 export function createMockCtx(options: MockCtxOptions = {}): MockCtx {
@@ -110,6 +114,8 @@ export function createMockCtx(options: MockCtxOptions = {}): MockCtx {
 	const confirmCalls: MockCtx["confirmCalls"] = [];
 	let aborted = false;
 	const idle = options.idle ?? true;
+	let branch = options.branchEntries ?? options.storedEntries ?? [];
+	const branchEntries = () => branch;
 
 	const ctx = {
 		cwd: "/tmp/pi-goal-test",
@@ -137,10 +143,20 @@ export function createMockCtx(options: MockCtxOptions = {}): MockCtx {
 		},
 		sessionManager: {
 			getEntries: () => options.storedEntries ?? [],
+			getBranch: () => branchEntries(),
 		},
 	} as unknown as ExtensionContext;
 
-	return { ctx, notifications, statuses, confirmCalls, isAborted: () => aborted };
+	return {
+		ctx,
+		notifications,
+		statuses,
+		confirmCalls,
+		isAborted: () => aborted,
+		setBranch: (entries) => {
+			branch = entries;
+		},
+	};
 }
 
 export function fire(pi: MockPi, event: string, eventPayload: any, ctx: any): unknown[] {

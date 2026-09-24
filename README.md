@@ -77,26 +77,27 @@ or simply want a human checkpoint, start pi with `--goal-confirm`.
 
 ## How it works
 
-- **Continuation loop** — on `agent_end`, if the goal is still active, a hidden
-  continuation message is queued as a follow-up, so pi continues the run. No timers;
-  user messages steered mid-run are always delivered first.
+- **Continuation loop** — at pi's `agent_before_settle` boundary (after retries,
+  auto-compaction and your queued messages are done), if the goal is still active, a
+  hidden continuation carrying the objective, the live turn count and the audit rules
+  is appended and pi makes one more model call. No timers. An exhausted error pauses
+  the goal.
+- **Prompt-cache friendly** — every goal message the model sees is persistent and
+  appended at the end of the conversation: the goal reminder at start, status notes
+  (paused/cancelled), continuations, and periodic `goal-progress` pings. Nothing is
+  injected per call, edited or removed, so creating, pausing, resuming, completing,
+  cancelling or replacing a goal only extends the cached prefix — including codex
+  response chaining. Mid-run notes are queued for the turn boundary, never steered in.
 - **Compaction-proof** — goal state lives in session custom entries (never enters LLM
-  context), and the objective is re-injected before every LLM call via the `context`
-  event. Compaction summarizes the conversation; it cannot lose the goal.
-- **Prompt-cache friendly** — the injected reminder is a pure function of the
-  objective, placed at the head of the conversation and kept byte-identical across
-  the goal's whole lifecycle, so the provider's cache prefix survives calls AND
-  pause/resume/blocked/complete. Live progress (turn count, objective refresh)
-  rides on periodic persistent `goal-progress` pings; lifecycle changes append
-  persistent `goal-status` notes — both cache-neutral. Only creating, cancelling,
-  or replacing a goal can invalidate the cache (once each, user-initiated).
-  (An earlier version injected a per-turn counter at the tail; it broke response
-  chaining on every call and cost real money.)
+  context). After a compaction the goal reminder is appended again (free: compaction
+  already resets the cache), and every continuation repeats the objective anyway.
+- **Branch-aware** — goal state is read from the current session branch, so `/tree`
+  navigation and forks see the goal as it was at that point.
 - **Honest endings** — the prompt wording (adapted from kimi-code's iterated audit
   language) pushes the agent to verify against current evidence before `complete`, and
   to only declare `blocked` after the same blocker repeats for 3 consecutive goal turns.
-- **Interrupts** — Esc pauses the goal; resuming a session restores an active goal as
-  paused; explicit `/goal resume` continues it.
+- **Interrupts** — Esc pauses the goal; resuming a session or switching branches
+  restores an active goal as paused; explicit `/goal resume` continues it.
 - **Visibility** — a footer status (`goal: active (turn N)`), inline lifecycle markers
   (started/paused/complete/blocked), hidden continuation messages.
 

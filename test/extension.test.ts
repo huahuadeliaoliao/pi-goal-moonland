@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
-import goalMode from "../index.ts";
+import goalMode, { hostSupportsBoundaries } from "../index.ts";
 import { createMockCtx, createMockPi, fireAsync } from "./helpers.ts";
 
 function setup(ctxOptions = {}) {
@@ -36,6 +36,14 @@ function messageText(m: any): string {
 
 const endedRun = (stopReason: string) => ({ messages: [{ role: "assistant", stopReason }] });
 
+const settle = (outcome = "completed") => ({ type: "agent_before_settle", outcome, entries: [], continue: false });
+const turnEnd = () => ({ type: "turn_end", entries: [], continue: false });
+
+/** Drafts a boundary handler returned (turn_end / agent_before_settle). */
+function draftsOf(out: any[]): any[] {
+	return (out[0] as { entries?: any[] } | undefined)?.entries ?? [];
+}
+
 // ------------------------------------------------------------- registration
 
 test("registers the goal tool, /goal command, flags and the event renderer", () => {
@@ -70,6 +78,14 @@ test("/goal <objective> creates an active goal and sends it as a user message", 
 	assert.equal(mock.sentUserMessages[0].content, "fix every failing test");
 	assert.equal(mock.sentUserMessages[0].options, undefined, "idle start sends a plain user message");
 	assert.ok(mock.notifications.some((n) => n.level === "info" && n.text.includes("Goal started")));
+
+	// The goal-mode reminder rides the same prompt as a persistent nextTurn message.
+	const reminders = mock.sentMessages.filter((m) => m.message.customType === "goal-reminder");
+	assert.equal(reminders.length, 1);
+	assert.equal(reminders[0].options?.deliverAs, "nextTurn");
+	assert.equal(reminders[0].message.display, false);
+	assert.ok(messageText(reminders[0].message).includes("fix every failing test"));
+	assert.ok(messageText(reminders[0].message).includes("Completion audit"));
 });
 
 test("a second goal without replace is rejected", async () => {
@@ -120,6 +136,7 @@ test("pause and resume flip the goal; resume from idle kicks a continuation", as
 	assert.equal(continuations(mock).length, 1);
 	assert.equal(continuations(mock)[0].options?.triggerTurn, true);
 	assert.equal(continuations(mock)[0].message.display, false);
+	assert.ok(messageText(continuations(mock)[0].message).includes("fix tests"), "the kick carries the objective");
 });
 
 test("pause/resume/cancel without a matching goal warn and do nothing", async () => {
@@ -137,6 +154,8 @@ test("cancel drops the goal and aborts goal-driven work when busy", async () => 
 	const cmd = mock.commands.get("goal")!.handler;
 	await cmd("fix tests", mock.ctx);
 	assert.equal(mock.sentUserMessages[0].options?.deliverAs, "steer", "mid-run start steers the objective in");
+	const reminder = mock.sentMessages.find((m) => m.message.customType === "goal-reminder");
+	assert.equal(reminder?.options?.triggerTurn, false, "mid-run reminder is queued for the turn boundary");
 
 	await cmd("cancel", mock.ctx);
 	assert.equal(stateOf(mock), null);
@@ -270,34 +289,42 @@ test("goal tool resume reactivates paused/blocked goals only", async () => {
 
 // -------------------------------------------------------- continuation loop
 
-test("agent_end with an active goal queues a hidden continuation as followUp", async () => {
+test("agent_before_settle appends a continuation draft and requests one more call", async () => {
 	const mock = setup();
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
 	mock.sentMessages.length = 0;
 
-	await fireAsync(mock, "agent_end", endedRun("end"), mock.ctx);
-	assert.equal(mock.sentMessages.length, 1);
-	const { message, options } = mock.sentMessages[0];
-	assert.equal(message.customType, "goal-continuation");
-	assert.equal(message.display, false);
-	assert.equal(options?.deliverAs, "followUp");
-	assert.ok(String(message.content).includes("Continue working toward the active goal"));
-	assert.ok(
-		!String(message.content).includes("fix tests"),
-		"continuations are fully static: no objective, no counters",
-	);
+	await fireAsync(mock, "agent_end", endedRun("stop"), mock.ctx);
+	assert.equal(mock.sentMessages.length, 0, "agent_end no longer queues anything");
+
+	const prior = { type: "custom", customType: "other", data: 1 };
+	const out = await fireAsync(mock, "agent_before_settle", { ...settle(), entries: [prior] }, mock.ctx);
+	const result = out[0] as { entries: any[]; continue: boolean };
+	assert.equal(result.continue, true);
+	assert.equal(result.entries[0], prior, "earlier handlers' drafts are kept in order");
+	assert.equal(result.entries.length, 2);
+	const draft = result.entries[1];
+	assert.equal(draft.type, "custom_message");
+	assert.equal(draft.customType, "goal-continuation");
+	assert.equal(draft.display, false);
+	assert.ok(draft.content.includes("Continue working toward the active goal"));
+	assert.ok(draft.content.includes("fix tests"), "the continuation carries the objective");
+	assert.ok(draft.content.includes("Goal turns so far: 1"), "and the live turn count");
 });
 
-test("agent_end does nothing without an active goal", async () => {
+test("agent_before_settle does nothing without an active goal", async () => {
 	const mock = setup();
-	await fireAsync(mock, "agent_end", endedRun("end"), mock.ctx);
-	assert.equal(mock.sentMessages.length, 0);
+	assert.equal((await fireAsync(mock, "agent_before_settle", settle(), mock.ctx))[0], undefined);
 
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	await mock.commands.get("goal")!.handler("pause", mock.ctx);
-	mock.sentMessages.length = 0;
-	await fireAsync(mock, "agent_end", endedRun("end"), mock.ctx);
-	assert.equal(mock.sentMessages.length, 0, "a paused goal never continues");
+	assert.equal((await fireAsync(mock, "agent_before_settle", settle(), mock.ctx))[0], undefined, "paused: no loop");
+
+	const done = setup();
+	await done.tools.get("goal")!.execute("t1", { op: "create", objective: "x" }, undefined, undefined, done.ctx);
+	await done.tools.get("goal")!.execute("t2", { op: "complete" }, undefined, undefined, done.ctx);
+	assert.equal((await fireAsync(done, "agent_before_settle", settle(), done.ctx))[0], undefined, "complete: no loop");
 });
 
 test("an interrupted run pauses the goal instead of continuing", async () => {
@@ -313,21 +340,32 @@ test("an interrupted run pauses the goal instead of continuing", async () => {
 	);
 	const notes = mock.sentMessages.filter((m) => m.message.customType === "goal-status");
 	assert.equal(notes.length, 1, "the pause lands as a persistent status note");
+	assert.equal(notes[0].options?.triggerTurn, false, "queued, not a steer that rides into the next run");
 	assert.ok(String(notes[0].message.content).includes("paused after interruption"));
 	assert.equal(stateOf(mock).status, "paused");
 	assert.equal(stateOf(mock).reason, "paused after interruption");
 	assert.deepEqual(goalEvents(mock), ["created", "paused"]);
 });
 
-test("an errored run stays active; agent_settled on an idle runtime is the safety net", async () => {
+test("an error outcome at the settle boundary pauses the goal (retries are already exhausted)", async () => {
 	const mock = setup();
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	mock.sentMessages.length = 0;
 
 	await fireAsync(mock, "agent_end", endedRun("error"), mock.ctx);
-	assert.equal(mock.sentMessages.length, 0, "no continuation on error: pi may auto-retry");
-	assert.equal(stateOf(mock).status, "active");
+	assert.equal(stateOf(mock).status, "active", "agent_end leaves errors to the retry machinery");
 
+	const out = await fireAsync(mock, "agent_before_settle", settle("error"), mock.ctx);
+	assert.equal(out[0], undefined, "no continuation after an exhausted error");
+	assert.equal(stateOf(mock).status, "paused");
+	assert.equal(stateOf(mock).reason, "paused after an error");
+	const note = mock.sentMessages.find((m) => m.message.customType === "goal-status");
+	assert.equal(note?.options?.triggerTurn, false, "the pause note never steers");
+});
+
+test("agent_settled on an idle runtime is the safety net", async () => {
+	const mock = setup();
+	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	await fireAsync(mock, "agent_settled", {}, mock.ctx);
 	assert.equal(stateOf(mock).status, "paused");
 	assert.equal(stateOf(mock).reason, "paused after run ended unexpectedly");
@@ -337,18 +375,18 @@ test("an errored run stays active; agent_settled on an idle runtime is the safet
 
 test("turn_end counts goal turns for active goals only", async () => {
 	const mock = setup();
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
 
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
 	// The counter is in-memory between runs: observe it via /goal status.
 	await mock.commands.get("goal")!.handler("status", mock.ctx);
 	assert.ok(mock.notifications.at(-1)?.text.includes("Goal turns: 2"));
 	assert.equal(mock.statuses.get("goal"), "goal: active (turn 2)");
 
 	await mock.commands.get("goal")!.handler("pause", mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
 	assert.equal(stateOf(mock).turnsUsed, 2, "a paused goal does not count turns");
 });
 
@@ -357,8 +395,8 @@ test("turns persist at run boundaries and shutdown, not on every turn", async ()
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	const afterStart = stateEntries(mock).length;
 
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
+	await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
 	assert.equal(stateEntries(mock).length, afterStart, "no per-turn session writes");
 	assert.equal(mock.statuses.get("goal"), "goal: active (turn 2)", "the footer still tracks turns live");
 
@@ -372,129 +410,121 @@ test("turns persist at run boundaries and shutdown, not on every turn", async ()
 
 // ------------------------------------------------------------------- context
 
-test("context injects the reminder at the HEAD and leaves history append-only", async () => {
+test("no per-call injection: context hooks are not registered (prompt-cache contract)", async () => {
 	const mock = setup();
-	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
-
-	const cont = { role: "custom", customType: "goal-continuation", content: "continue", timestamp: 1 };
-	const other = { role: "custom", customType: "other", content: "note", timestamp: 1 };
-	const user = { role: "user", content: "hi", timestamp: 2 };
-	const input = [cont, user, cont, other];
-	const out = await fireAsync(mock, "context", { messages: input }, mock.ctx);
-
-	const messages = (out[0] as { messages: any[] }).messages;
-	assert.equal(messages.length, input.length + 1, "nothing is removed from history");
-	assert.equal(
-		messages.filter((m) => m.customType === "goal-continuation").length,
-		2,
-		"stale continuations are kept (static text, never pruned mid-history)",
-	);
-	assert.deepEqual(messages.slice(1), input, "existing messages keep their order, untouched");
-
-	const head = messages[0];
-	assert.equal(head.role, "user");
-	const text = messageText(head);
-	assert.ok(text.includes("fix tests"));
-	assert.ok(text.includes("registered goal"));
+	assert.equal(mock.handlers.get("context"), undefined);
+	assert.equal(mock.handlers.get("context_with_system"), undefined);
 });
 
-test("context reminder is byte-stable across turns and lifecycle transitions (prompt-cache contract)", async () => {
-	const mock = setup();
-	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
-	const user = { role: "user", content: "hi", timestamp: 2 };
-	const headOf = async () =>
-		messageText(
-			((await fireAsync(mock, "context", { messages: [user] }, mock.ctx))[0] as { messages: any[] }).messages[0],
+test("every goal message is appended with explicit options and never steers", async () => {
+	const mock = setup({ idle: false });
+	const cmd = mock.commands.get("goal")!.handler;
+	await cmd("fix tests", mock.ctx);
+	await cmd("pause", mock.ctx);
+	await cmd("resume", mock.ctx);
+	await cmd("replace other objective", mock.ctx);
+	await fireAsync(mock, "agent_end", endedRun("aborted"), mock.ctx);
+	await cmd("cancel", mock.ctx);
+	assert.ok(mock.sentMessages.length >= 5);
+	for (const { message, options } of mock.sentMessages) {
+		assert.ok(options, `${message.customType} must carry explicit options`);
+		assert.notEqual(options.deliverAs, "steer");
+		assert.ok(
+			options.triggerTurn === false || options.deliverAs === "nextTurn" || options.triggerTurn === true,
+			`${message.customType}: unexpected delivery ${JSON.stringify(options)}`,
 		);
-
-	const active = await headOf();
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	assert.equal(await headOf(), active, "unchanged as turns accrue");
-
-	await mock.commands.get("goal")!.handler("pause", mock.ctx);
-	assert.equal(await headOf(), active, "unchanged by pause");
-	await mock.commands.get("goal")!.handler("resume", mock.ctx);
-	assert.equal(await headOf(), active, "unchanged by resume");
-	await mock.tools.get("goal")!.execute("t1", { op: "complete" }, undefined, undefined, mock.ctx);
-	assert.equal(await headOf(), active, "unchanged by completion");
+	}
 });
 
-test("context output is prefix-stable as history grows (response-chaining contract)", async () => {
+test("boundary drafts only append custom messages (no context edits, no compactions)", async () => {
 	const mock = setup();
+	mock.flags.set("goal-progress-interval", "1");
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
-	const m1 = { role: "user", content: "hi", timestamp: 1 };
-	const m2 = { role: "assistant", content: [{ type: "text", text: "working" }], timestamp: 2 };
-	const m3 = { role: "toolResult", content: "done", timestamp: 3 };
-
-	const wire = (m: any) => JSON.stringify({ role: m.role, customType: m.customType, content: m.content });
-	const out1 = (
-		(await fireAsync(mock, "context", { messages: [m1] }, mock.ctx))[0] as { messages: any[] }
-	).messages.map(wire);
-	const out2 = (
-		(await fireAsync(mock, "context", { messages: [m1, m2, m3] }, mock.ctx))[0] as { messages: any[] }
-	).messages.map(wire);
-	assert.deepEqual(out2.slice(0, out1.length), out1, "growing the input must only extend the output");
+	await fireAsync(mock, "agent_start", {}, mock.ctx);
+	await fireAsync(mock, "session_compact", {}, mock.ctx);
+	const drafts = [
+		...draftsOf(await fireAsync(mock, "turn_end", turnEnd(), mock.ctx)),
+		...draftsOf(await fireAsync(mock, "turn_end", turnEnd(), mock.ctx)),
+		...draftsOf(await fireAsync(mock, "agent_before_settle", settle(), mock.ctx)),
+	];
+	assert.ok(drafts.length >= 3);
+	for (const d of drafts) assert.equal(d.type, "custom_message");
 });
 
-test("turn_end appends a persistent progress ping on cadence, without an extra turn", async () => {
+test("turn_end appends a progress ping draft on cadence, without an extra call", async () => {
 	const mock = setup();
 	mock.flags.set("goal-progress-interval", "3");
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 
-	const pings = () => mock.sentMessages.filter((m) => m.message.customType === "goal-progress");
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	assert.equal(pings().length, 0, "no ping before the interval");
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	assert.equal(pings().length, 1, "ping on the interval boundary");
-	const ping = pings()[0];
-	assert.equal(ping.options, undefined, "queued without triggerTurn: no extra model call");
-	assert.ok(messageText(ping.message).includes("3 goal turns so far"));
-	assert.ok(messageText(ping.message).includes("fix tests"));
-
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	assert.equal(pings().length, 1, "cadence respected after the ping");
+	const pingAt = async () => {
+		const out = await fireAsync(mock, "turn_end", turnEnd(), mock.ctx);
+		assert.notEqual((out[0] as any)?.continue, true, "a ping never requests a model call");
+		return draftsOf(out).filter((d) => d.customType === "goal-progress");
+	};
+	assert.equal((await pingAt()).length, 0);
+	assert.equal((await pingAt()).length, 0, "no ping before the interval");
+	const pings = await pingAt();
+	assert.equal(pings.length, 1, "ping on the interval boundary");
+	assert.ok(pings[0].content.includes("3 goal turns so far"));
+	assert.ok(pings[0].content.includes("fix tests"));
+	assert.equal((await pingAt()).length, 0, "cadence respected after the ping");
 	assert.equal(mock.statuses.get("goal"), "goal: active (turn 4)", "turn counting unaffected by pings");
 });
 
-test("session_compact arms an immediate progress ping on the next turn", async () => {
+test("compaction inside a run re-appends the reminder at the next boundary, once", async () => {
 	const mock = setup();
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
-	const pings = () => mock.sentMessages.filter((m) => m.message.customType === "goal-progress");
+	await fireAsync(mock, "agent_start", {}, mock.ctx);
+	mock.sentMessages.length = 0;
 
 	await fireAsync(mock, "session_compact", {}, mock.ctx);
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	assert.equal(pings().length, 1, "compaction re-surfaces the objective at the next boundary");
-	assert.ok(messageText(pings()[0].message).includes("fix tests"));
-
-	await fireAsync(mock, "turn_end", {}, mock.ctx);
-	assert.equal(pings().length, 1, "the armed ping fires once");
+	assert.equal(mock.sentMessages.length, 0, "mid-run: armed, not sent");
+	const first = draftsOf(await fireAsync(mock, "turn_end", turnEnd(), mock.ctx));
+	assert.equal(first.length, 1);
+	assert.equal(first[0].customType, "goal-reminder");
+	assert.ok(first[0].content.includes("fix tests"));
+	assert.equal(draftsOf(await fireAsync(mock, "turn_end", turnEnd(), mock.ctx)).length, 0, "fires once");
 });
 
-test("context injects for any existing goal, opts out only when none exists", async () => {
+test("compaction right before settle: the continuation already carries the objective", async () => {
 	const mock = setup();
-	let out = await fireAsync(mock, "context", { messages: [] }, mock.ctx);
-	assert.equal(out[0], undefined, "no goal: the handler opts out, messages unchanged");
+	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
+	await fireAsync(mock, "agent_start", {}, mock.ctx);
+	await fireAsync(mock, "session_compact", {}, mock.ctx);
+	const drafts = draftsOf(await fireAsync(mock, "agent_before_settle", settle(), mock.ctx));
+	assert.deepEqual(
+		drafts.map((d) => d.customType),
+		["goal-continuation"],
+	);
+	assert.equal(draftsOf(await fireAsync(mock, "turn_end", turnEnd(), mock.ctx)).length, 0, "reminder disarmed");
+});
 
+test("compaction of a paused goal re-appends a status-aware reminder at settle", async () => {
+	const mock = setup();
 	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
 	await mock.commands.get("goal")!.handler("pause", mock.ctx);
-	out = await fireAsync(mock, "context", { messages: [] }, mock.ctx);
-	const paused = (out[0] as { messages: any[] }).messages;
-	assert.equal(paused.length, 1);
-	assert.ok(messageText(paused[0]).includes("fix tests"), "paused goal: the objective stays injected");
-	assert.ok(messageText(paused[0]).includes("registered goal"));
+	await fireAsync(mock, "agent_start", {}, mock.ctx);
+	await fireAsync(mock, "session_compact", {}, mock.ctx);
+	const out = await fireAsync(mock, "agent_before_settle", settle(), mock.ctx);
+	const drafts = draftsOf(out);
+	assert.equal((out[0] as any).continue, undefined, "a paused goal never continues");
+	assert.equal(drafts.length, 1);
+	assert.ok(drafts[0].content.includes("status is paused"));
+});
 
-	const done = setup();
-	await done.commands.get("goal")!.handler("fix tests", done.ctx);
-	await done.tools.get("goal")!.execute("t1", { op: "complete" }, undefined, undefined, done.ctx);
-	out = await fireAsync(done, "context", { messages: [] }, done.ctx);
-	const completed = (out[0] as { messages: any[] }).messages;
-	assert.equal(completed.length, 1, "completed goal: injection continues, bytes unchanged");
+test("idle /compact appends the reminder immediately; completed goals get none", async () => {
+	const mock = setup();
+	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
+	mock.sentMessages.length = 0;
+	await fireAsync(mock, "session_compact", {}, mock.ctx);
+	const reminders = mock.sentMessages.filter((m) => m.message.customType === "goal-reminder");
+	assert.equal(reminders.length, 1);
+	assert.equal(reminders[0].options?.triggerTurn, false);
 
-	await mock.commands.get("goal")!.handler("cancel", mock.ctx);
-	out = await fireAsync(mock, "context", { messages: [] }, mock.ctx);
-	assert.equal(out[0], undefined, "cancelled goal: the record is gone, no injection");
+	await mock.tools.get("goal")!.execute("t1", { op: "complete" }, undefined, undefined, mock.ctx);
+	mock.sentMessages.length = 0;
+	await fireAsync(mock, "session_compact", {}, mock.ctx);
+	assert.equal(mock.sentMessages.length, 0);
 });
 
 test("pause and cancel append persistent status notes", async () => {
@@ -556,6 +586,8 @@ test("--goal starts a goal on startup in TUI mode", async () => {
 	// The kick is deferred so the interactive mode finishes subscribing.
 	await new Promise((r) => setTimeout(r, 500));
 	assert.equal(mock.sentUserMessages.at(-1)?.content, "fix tests from flag");
+	const reminder = mock.sentMessages.find((m) => m.message.customType === "goal-reminder");
+	assert.equal(reminder?.options?.deliverAs, "nextTurn", "the flag start carries the goal reminder too");
 });
 
 test("a headless start without waitForIdle degrades gracefully instead of throwing", async () => {
@@ -585,4 +617,52 @@ test("--goal is ignored when a live goal exists or the mode is not interactive",
 	headless.flags.set("goal", "fix tests");
 	await fireAsync(headless, "session_start", { reason: "startup" }, headless.ctx);
 	assert.equal(headless.appendedEntries.length, 0, "print mode: the flag is ignored");
+});
+
+// ----------------------------------------------------------------- branches
+
+const stateEntry = (data: any) => ({ type: "custom", customType: "goal-state", data });
+
+test("session_start reads goal state from the current branch, not the whole file", async () => {
+	const mock = setup({
+		storedEntries: [
+			stateEntry({ objective: "other branch", status: "paused", turnsUsed: 1, createdAt: 1, updatedAt: 1 }),
+		],
+		branchEntries: [],
+	});
+	await fireAsync(mock, "session_start", { reason: "resume" }, mock.ctx);
+	await mock.commands.get("goal")!.handler("status", mock.ctx);
+	assert.ok(mock.notifications.at(-1)?.text.includes("No goal"));
+});
+
+test("session_tree re-reads the goal from the new branch", async () => {
+	const mock = setup();
+	await fireAsync(mock, "session_start", { reason: "startup" }, mock.ctx);
+	await mock.commands.get("goal")!.handler("fix tests", mock.ctx);
+
+	// Navigate to a point before the goal existed.
+	mock.setBranch([]);
+	await fireAsync(mock, "session_tree", { newLeafId: "a", oldLeafId: "b" }, mock.ctx);
+	await mock.commands.get("goal")!.handler("status", mock.ctx);
+	assert.ok(mock.notifications.at(-1)?.text.includes("No goal"));
+	assert.equal(mock.statuses.get("goal"), undefined);
+
+	// Navigate to a branch whose latest state is active: it comes back paused.
+	mock.setBranch([
+		stateEntry({ objective: "branch goal", status: "active", turnsUsed: 2, createdAt: 1, updatedAt: 1 }),
+	]);
+	await fireAsync(mock, "session_tree", { newLeafId: "c", oldLeafId: "a" }, mock.ctx);
+	assert.equal(stateOf(mock).objective, "branch goal");
+	assert.equal(stateOf(mock).status, "paused");
+	assert.equal(stateOf(mock).reason, "branch changed");
+});
+
+test("hostSupportsBoundaries gates on pi >= 0.87", () => {
+	assert.equal(hostSupportsBoundaries("0.87.1"), true);
+	assert.equal(hostSupportsBoundaries("0.87.0"), true);
+	assert.equal(hostSupportsBoundaries("0.90.0"), true);
+	assert.equal(hostSupportsBoundaries("1.0.0"), true);
+	assert.equal(hostSupportsBoundaries("0.86.1"), false);
+	assert.equal(hostSupportsBoundaries("0.85.1"), false);
+	assert.equal(hostSupportsBoundaries("dev"), true, "unknown formats assume a current host");
 });

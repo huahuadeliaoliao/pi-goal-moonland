@@ -20,26 +20,37 @@ test("the objective is wrapped as untrusted data and HTML-escaped", () => {
 	assert.ok(text.includes("&amp; co"));
 });
 
-test("the reminder is status-neutral and byte-stable across the whole goal lifecycle", () => {
-	const base = createGoalState("fix the failing tests");
-	const text = buildGoalReminder(base);
-	assert.ok(text.includes("registered goal"));
-	assert.ok(text.includes("fix the failing tests"));
-	// Cache contract: nothing in the per-call reminder may vary with status,
-	// turn counts, or timestamps — transitions must not change a single byte.
-	assert.ok(!text.includes("Status:"));
-	assert.ok(!text.includes("Goal turns so far"));
-	assert.equal(text, buildGoalReminder({ ...base, status: "paused", reason: "x" }), "paused");
-	assert.equal(text, buildGoalReminder({ ...base, status: "blocked", reason: "y" }), "blocked");
-	assert.equal(text, buildGoalReminder({ ...base, status: "complete", turnsUsed: 999 }), "complete");
+test("the reminder is status-aware: active carries progress and audit, inactive says do not pursue", () => {
+	const base = { ...createGoalState("fix the failing tests"), turnsUsed: 7 };
+	const active = buildGoalReminder(base);
+	assert.ok(active.includes("active goal"));
+	assert.ok(active.includes("fix the failing tests"));
+	assert.ok(active.includes("Goal turns so far: 7"));
+	assert.ok(active.includes("Completion audit"));
+	assert.ok(active.includes("Blocked audit"));
+
+	const paused = buildGoalReminder({ ...base, status: "paused", reason: "a < b" });
+	assert.ok(paused.includes("status is paused (a &lt; b)"));
+	assert.ok(paused.includes("/goal resume"));
+	assert.ok(paused.includes("fix the failing tests"), "the objective stays visible as data");
+	assert.ok(!paused.includes("Completion audit"));
+
+	const blocked = buildGoalReminder({ ...base, status: "blocked", reason: "needs credentials" });
+	assert.ok(blocked.includes("status is blocked (needs credentials)"));
+
+	const done = buildGoalReminder({ ...base, status: "complete" });
+	assert.ok(done.includes("do not continue goal-driven work"));
 });
 
-test("the continuation prompt is fully static and carries the audit language", () => {
-	const text = buildContinuationPrompt();
-	assert.ok(text.includes("Continue working toward the active goal"));
+test("the continuation carries the objective, the live turn count and the audit language", () => {
+	const goal = { ...createGoalState("ship <it>"), turnsUsed: 3 };
+	const text = buildContinuationPrompt(goal);
+	assert.ok(text.startsWith("Continue working toward the active goal"));
+	assert.ok(text.includes("&lt;it&gt;"), "the objective must be escaped");
+	assert.ok(text.includes("Goal turns so far: 3"));
 	assert.ok(text.includes("Completion audit"));
 	assert.ok(text.includes("Blocked audit"));
-	assert.equal(text, buildContinuationPrompt(), "continuation must be constant");
+	assert.notEqual(text, buildContinuationPrompt({ ...goal, turnsUsed: 4 }), "persistent: live data is fine here");
 });
 
 test("the progress ping carries the objective and the live turn count", () => {

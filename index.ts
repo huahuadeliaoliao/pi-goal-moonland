@@ -3,19 +3,22 @@
  *
  * A persistent autonomous objective loop, modeled on kimi-code's goal feature:
  * - A goal says what must become *true*, not what to do next.
- * - After each agent run ends with the goal still active, the runtime queues a
- *   hidden continuation (agent_end -> followUp), so the agent keeps working
- *   across runs until the model marks the goal complete/blocked via the tool.
- * - Goal state lives in custom session entries (outside LLM context), so
- *   compaction cannot touch it. The objective is re-injected before every LLM
- *   call via the `context` event, so compaction cannot lose it either. The
- *   injected reminder is a pure function of the objective (status-neutral on
- *   purpose) and sits at the head of the visible messages, keeping the
- *   provider's prompt-cache prefix stable across calls AND across goal
- *   lifecycle transitions; live progress and status changes ride on
- *   persistent messages appended at turn boundaries (cache-neutral).
- * - Interrupt (Esc) pauses the goal; resuming a session restores an active
- *   goal as paused. Errors pause via the agent_settled safety net.
+ * - When a run is about to settle with the goal still active, the
+ *   agent_before_settle boundary appends a hidden continuation (objective +
+ *   live turn count + audit language) and requests one more model call, so
+ *   the agent keeps working until the model marks the goal complete/blocked.
+ * - Goal state lives in custom session entries on the session tree (outside
+ *   LLM context), read from the current branch.
+ * - Prompt-cache contract (kimi-code style): every goal message the model
+ *   sees is PERSISTENT and APPENDED at the tail — the create reminder, status
+ *   notes, continuations, progress pings, and the post-compaction reminder.
+ *   Nothing is injected per call, edited, or removed, so goal lifecycle
+ *   changes (create, pause, resume, complete, cancel, replace) only ever
+ *   extend the prompt prefix. Mid-run messages are queued with
+ *   triggerTurn:false or boundary drafts, never as steers.
+ * - Interrupt (Esc) pauses the goal; an exhausted error pauses it; resuming a
+ *   session or switching branches restores an active goal as paused.
+ * - Requires pi >= 0.87 (actionable turn_end / agent_before_settle boundaries).
  *
  * Surfaces:
  * - /goal command: status | pause | resume | cancel | replace <obj> | <obj>
@@ -30,7 +33,13 @@ import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	type CustomMessageEntryDraft,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	VERSION,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -47,6 +56,7 @@ import { createGoalState, type GoalState, isLiveGoal, validateObjective } from "
 const CONTINUATION_TYPE = "goal-continuation";
 const PROGRESS_PING_TYPE = "goal-progress";
 const STATUS_NOTE_TYPE = "goal-status";
+const REMINDER_TYPE = "goal-reminder";
 const STATE_ENTRY_TYPE = "goal-state";
 const EVENT_ENTRY_TYPE = "goal-event";
 const DEFAULT_PROGRESS_INTERVAL = 20;
@@ -59,11 +69,28 @@ function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
 	return m.role === "assistant";
 }
 
+/** True when the host pi has the actionable boundaries this extension needs. */
+export function hostSupportsBoundaries(version: string): boolean {
+	const [major, minor] = version.split(".").map((part) => Number.parseInt(part, 10));
+	if (!Number.isFinite(major) || !Number.isFinite(minor)) return true; // unknown format: assume current
+	return major > 0 || minor >= 87;
+}
+
+function messageDraft(customType: string, content: string): CustomMessageEntryDraft {
+	return { type: "custom_message", customType, content, display: false };
+}
+
 export default function goalMode(pi: ExtensionAPI): void {
 	let goal: GoalState | null = null;
-	// When set, the next turn_end appends a progress ping regardless of cadence
-	// (armed by session_compact: compaction may have dropped earlier pings).
-	let pingArmed = false;
+	// Armed by a compaction that happened inside a run: the next boundary
+	// (turn_end or agent_before_settle) re-appends the goal reminder, since the
+	// summary may have dropped earlier goal messages. Free cache-wise: the
+	// compaction already invalidated the prefix.
+	let reminderArmed = false;
+	// Between agent_start and agent_settled. Decides whether a post-compaction
+	// reminder can be appended right away (idle /compact) or must wait for the
+	// next boundary.
+	let inRun = false;
 
 	function progressInterval(): number {
 		const raw = pi.getFlag("goal-progress-interval");
@@ -72,6 +99,14 @@ export default function goalMode(pi: ExtensionAPI): void {
 	}
 
 	// ------------------------------------------------------------- state core
+
+	/** Append a persistent, context-visible goal message without ever steering.
+	 * Idle: appended immediately. Mid-run: pi queues it and flushes it at the
+	 * next turn boundary, after the turn's tool results — no extra model call
+	 * and no leftover steer that rides into the next run. */
+	function appendNote(customType: string, content: string): void {
+		pi.sendMessage({ customType, content, display: false }, { triggerTurn: false });
+	}
 
 	function persistState(): void {
 		pi.appendEntry(STATE_ENTRY_TYPE, goal ? { ...goal } : null);
@@ -101,13 +136,12 @@ export default function goalMode(pi: ExtensionAPI): void {
 		persistState();
 		if (event) recordEvent(event, goal);
 		if (ctx) updateStatus(ctx);
-		// Persistent, append-only lifecycle notes (cache-neutral): the model's
-		// in-context signal for transitions that used to flip the ephemeral
-		// reminder's content (one full cache invalidation per flip before).
+		// Persistent, append-only lifecycle notes (cache-neutral). Complete and
+		// blocked need none: the goal tool's result already carries the outcome.
 		if (next?.status === "paused" && prev?.status !== "paused") {
-			pi.sendMessage({ customType: STATUS_NOTE_TYPE, content: buildPausedNote(next), display: false });
+			appendNote(STATUS_NOTE_TYPE, buildPausedNote(next));
 		} else if (next === null && event === "cancelled") {
-			pi.sendMessage({ customType: STATUS_NOTE_TYPE, content: buildCancelledNote(), display: false });
+			appendNote(STATUS_NOTE_TYPE, buildCancelledNote());
 		}
 	}
 
@@ -163,15 +197,28 @@ export default function goalMode(pi: ExtensionAPI): void {
 		await ctx.waitForIdle();
 	}
 
-	/** Kick off a goal run from an idle state (command/flag entry points). */
+	/** Kick a continuation run from an idle state (/goal resume). */
 	async function kick(content: string, ctx: ExtensionCommandContext): Promise<void> {
-		if (ctx.isIdle()) {
-			pi.sendMessage({ customType: CONTINUATION_TYPE, content, display: false }, { triggerTurn: true });
-		} else {
-			// Mid-stream: steer it in; the agent_end hook keeps the loop going.
-			pi.sendUserMessage(content, { deliverAs: "steer" });
-		}
+		pi.sendMessage({ customType: CONTINUATION_TYPE, content, display: false }, { triggerTurn: true });
 		await awaitRunIfHeadless(ctx);
+	}
+
+	/** A user-started goal: the objective goes in as a real user message
+	 * (visible in the transcript), followed by the persistent goal reminder
+	 * (goal-mode framing + audit language). Idle: the reminder rides the same
+	 * prompt as a nextTurn message. Busy: the objective is steered in and the
+	 * reminder is queued for the current turn boundary. */
+	function announceGoal(created: GoalState, idle: boolean): void {
+		if (idle) {
+			pi.sendMessage(
+				{ customType: REMINDER_TYPE, content: buildGoalReminder(created), display: false },
+				{ deliverAs: "nextTurn" },
+			);
+			pi.sendUserMessage(created.objective);
+		} else {
+			appendNote(REMINDER_TYPE, buildGoalReminder(created));
+			pi.sendUserMessage(created.objective, { deliverAs: "steer" });
+		}
 	}
 
 	function lastAssistantStopReason(messages: AgentMessage[]): string | undefined {
@@ -215,7 +262,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 					}
 					setGoal({ ...goal, status: "active", reason: undefined }, ctx, "resumed");
 					ctx.ui.notify("Goal resumed.", "info");
-					if (ctx.isIdle()) await kick(buildContinuationPrompt(), ctx);
+					if (ctx.isIdle() && goal) await kick(buildContinuationPrompt(goal), ctx);
 					return;
 				}
 				if (sub === "cancel") {
@@ -249,12 +296,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 	async function startFromCommand(objective: string, ctx: ExtensionCommandContext): Promise<void> {
 		const created = createGoal(objective, ctx);
 		ctx.ui.notify("Goal started. It will keep working across turns until complete or blocked.", "info");
-		// The objective goes in as a real user message (visible in transcript).
-		if (ctx.isIdle()) {
-			pi.sendUserMessage(created.objective);
-		} else {
-			pi.sendUserMessage(created.objective, { deliverAs: "steer" });
-		}
+		announceGoal(created, ctx.isIdle());
 		await awaitRunIfHeadless(ctx);
 	}
 
@@ -346,64 +388,62 @@ export default function goalMode(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ hooks
 
-	// Per-LLM-call injection (compaction-safe). Cache contract: the reminder is
-	// a pure function of the objective — status-neutral on purpose — and sits
-	// at the HEAD of the visible messages. It is injected whenever a goal
-	// record exists (active, paused, blocked, or complete), so lifecycle
-	// transitions no longer change a single byte: the prompt-cache prefix
-	// survives pause/resume/blocked/complete. Only creation, cancel, and
-	// replace alter it (one irreducible invalidation each, all user-initiated).
-	// Status signals ride persistent appended notes instead (see setGoal).
-	pi.on("context", async (event) => {
-		if (!goal) return;
-		const reminder = {
-			role: "user",
-			content: [{ type: "text", text: buildGoalReminder(goal) }],
-			timestamp: Date.now(),
-		} as AgentMessage;
-		return { messages: [reminder, ...event.messages] };
+	// No `context` hook on purpose: a per-call injection is either unstable
+	// (breaks prefix caches on lifecycle changes) or not a prefix extension
+	// (breaks codex response chaining). All goal messages are appended.
+
+	pi.on("agent_start", async () => {
+		inRun = true;
 	});
 
 	// Count goal turns (kimi semantics: a turn is a turn, whether it starts a
 	// new run or continues the current one). In-memory between runs: persists at
 	// run boundaries (agent_end) and on session_shutdown instead of once per turn.
-	// The counter feeds the reminder's "Goal turns so far" and the 3-turn blocked
-	// audit, so a hard kill under-reports it and a blocked declaration may land
-	// slightly late after a crash — accepted trade (quit/reload/SIGTERM/SIGHUP
-	// all emit session_shutdown; only SIGKILL slips through).
-	pi.on("turn_end", async (_event, ctx) => {
-		if (goal?.status !== "active") return;
-		goal = { ...goal, turnsUsed: goal.turnsUsed + 1, updatedAt: Date.now() };
-		updateStatus(ctx);
-		// Periodic progress ping: a PERSISTENT tail-appended message, so it only
-		// ever extends the prompt prefix (cache-neutral). It carries the live
-		// counter and re-surfaces the objective near the tail in long runs. The
-		// send is queued mid-run and flushed by pi at this turn boundary — no
-		// extra model call, and turn counting is unaffected.
-		const interval = progressInterval();
-		if (pingArmed || (interval > 0 && goal.turnsUsed % interval === 0)) {
-			pingArmed = false;
-			pi.sendMessage({ customType: PROGRESS_PING_TYPE, content: buildProgressPing(goal), display: false });
+	// The counter feeds the continuation's "Goal turns so far" and the 3-turn
+	// blocked audit, so a hard kill under-reports it — accepted trade (quit/
+	// reload/SIGTERM/SIGHUP all emit session_shutdown; only SIGKILL slips).
+	// Boundary drafts land after this turn's tool results, before the next
+	// model request, and never trigger an extra call on their own.
+	pi.on("turn_end", async (event, ctx) => {
+		const drafts: CustomMessageEntryDraft[] = [];
+		if (reminderArmed && goal && goal.status !== "complete") {
+			reminderArmed = false;
+			drafts.push(messageDraft(REMINDER_TYPE, buildGoalReminder(goal)));
+		}
+		if (goal?.status === "active") {
+			goal = { ...goal, turnsUsed: goal.turnsUsed + 1, updatedAt: Date.now() };
+			updateStatus(ctx);
+			// Periodic progress ping for long runs (many tool turns between
+			// continuations): re-surfaces the objective near the tail.
+			const interval = progressInterval();
+			if (drafts.length === 0 && interval > 0 && goal.turnsUsed % interval === 0) {
+				drafts.push(messageDraft(PROGRESS_PING_TYPE, buildProgressPing(goal)));
+			}
+		}
+		if (drafts.length === 0) return;
+		return { entries: [...(event.entries ?? []), ...drafts] };
+	});
+
+	// Compaction may summarize earlier goal messages away. Idle (/compact):
+	// append the status-aware reminder right away. Inside a run: arm it for the
+	// next boundary, where it lands before the next model request.
+	pi.on("session_compact", async () => {
+		if (!goal || goal.status === "complete") return;
+		if (inRun) {
+			reminderArmed = true;
+		} else {
+			appendNote(REMINDER_TYPE, buildGoalReminder(goal));
 		}
 	});
 
-	// Compaction may summarize earlier pings away; re-arm so the next turn
-	// boundary re-surfaces the objective and counter near the tail.
-	pi.on("session_compact", async () => {
-		if (goal?.status === "active") pingArmed = true;
-	});
-
-	// The continuation loop: a run ended with the goal still active -> queue a
-	// hidden continuation as a followUp. pi drains queues after agent_end and
-	// continues the run, so this works identically in TUI, print, and RPC mode.
+	// Run boundary bookkeeping: an interrupted run pauses the goal; otherwise
+	// persist the turn counter accrued since the last write.
 	pi.on("agent_end", async (event, ctx) => {
 		if (goal?.status !== "active") return;
-		const stopReason = lastAssistantStopReason(event.messages);
-		if (stopReason === "aborted") {
+		if (lastAssistantStopReason(event.messages) === "aborted") {
 			setGoal({ ...goal, status: "paused", reason: "paused after interruption" }, ctx, "paused");
 			return;
 		}
-		// Run boundary: persist the turn counter accrued since the last write.
 		// Isolated from the loop: a failing appendEntry must not silently stop
 		// continuations — the loop matters more than the counter.
 		try {
@@ -411,19 +451,48 @@ export default function goalMode(pi: ExtensionAPI): void {
 		} catch {
 			/* session store may be unavailable */
 		}
-		if (stopReason === "error") {
-			// Pi may auto-retry; the agent_settled safety net handles exhaustion.
+	});
+
+	// The continuation loop. agent_before_settle is pi's final actionable
+	// boundary: it fires only after retries, auto-compaction, and queued user
+	// messages are done, and it reports the run's outcome. With the goal still
+	// active, append the continuation as a session entry and request exactly
+	// one more model call; that call ends in another settle boundary, and so on
+	// until the model completes/blocks the goal or the user pauses/cancels it.
+	pi.on("agent_before_settle", async (event, ctx) => {
+		if (!goal) {
+			reminderArmed = false;
 			return;
 		}
-		pi.sendMessage(
-			{ customType: CONTINUATION_TYPE, content: buildContinuationPrompt(), display: false },
-			{ deliverAs: "followUp" },
-		);
+		if (goal.status !== "active") {
+			if (!reminderArmed || goal.status === "complete") {
+				reminderArmed = false;
+				return;
+			}
+			reminderArmed = false;
+			return { entries: [...(event.entries ?? []), messageDraft(REMINDER_TYPE, buildGoalReminder(goal))] };
+		}
+		if (event.outcome === "aborted") {
+			setGoal({ ...goal, status: "paused", reason: "paused after interruption" }, ctx, "paused");
+			return;
+		}
+		if (event.outcome === "error") {
+			// Retries (if any) are already exhausted at this boundary.
+			setGoal({ ...goal, status: "paused", reason: "paused after an error" }, ctx, "paused");
+			return;
+		}
+		// The continuation carries the objective, so a pending reminder is moot.
+		reminderArmed = false;
+		return {
+			entries: [...(event.entries ?? []), messageDraft(CONTINUATION_TYPE, buildContinuationPrompt(goal))],
+			continue: true,
+		};
 	});
 
 	// Safety net: an active goal should never see the agent settle. If it does
 	// (e.g. retries exhausted after an error), pause instead of spinning idle.
 	pi.on("agent_settled", async (_event, ctx) => {
+		inRun = false;
 		if (goal?.status === "active" && ctx.isIdle()) {
 			setGoal({ ...goal, status: "paused", reason: "paused after run ended unexpectedly" }, ctx, "paused");
 		}
@@ -439,19 +508,28 @@ export default function goalMode(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Restore state on start/resume; an active goal always comes back paused.
-	pi.on("session_start", async (event, ctx) => {
-		const entries = ctx.sessionManager.getEntries().filter((e) => e.type === "custom");
-		const stateEntry = entries
+	/** Goal state is branch-relative: take the latest goal-state entry on the
+	 * current branch (root -> leaf), so /tree navigation and forks see the goal
+	 * as it was at that point. An active goal always comes back paused. */
+	function restoreFromBranch(ctx: ExtensionContext, pauseReason: string): void {
+		inRun = false;
+		reminderArmed = false;
+		const stateEntry = ctx.sessionManager
+			.getBranch()
 			.filter((e) => e.type === "custom" && (e as { customType?: string }).customType === STATE_ENTRY_TYPE)
 			.pop() as { data?: GoalState | null } | undefined;
-		if (stateEntry?.data) {
-			goal = stateEntry.data;
-			if (goal.status === "active") {
-				setGoal({ ...goal, status: "paused", reason: "session resumed" }, ctx, "paused");
-			}
+		goal = stateEntry?.data ?? null;
+		if (goal?.status === "active") {
+			setGoal({ ...goal, status: "paused", reason: pauseReason }, ctx, "paused");
 		}
 		updateStatus(ctx);
+	}
+
+	pi.on("session_start", async (event, ctx) => {
+		if (!hostSupportsBoundaries(VERSION)) {
+			ctx.ui.notify(`pi-goal needs pi >= 0.87 (found ${VERSION}); goal continuation will not run.`, "error");
+		}
+		restoreFromBranch(ctx, "session resumed");
 
 		// --goal "<objective>": start the session with a goal (TUI/RPC only;
 		// headless goal usage is `pi -p "/goal ..."`).
@@ -462,7 +540,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 					const created = createGoal(flagObjective, ctx);
 					// Defer the kick so the interactive mode finishes subscribing.
 					setTimeout(() => {
-						if (goal?.status === "active") pi.sendUserMessage(created.objective);
+						if (goal?.status === "active") announceGoal(created, true);
 					}, 400);
 				} catch {
 					// Invalid objective: surfaced via notify on the next line anyway.
@@ -470,6 +548,11 @@ export default function goalMode(pi: ExtensionAPI): void {
 				}
 			}
 		}
+	});
+
+	// Branch navigation: re-read the goal from the new branch.
+	pi.on("session_tree", async (_event, ctx) => {
+		restoreFromBranch(ctx, "branch changed");
 	});
 
 	// Bundle the write-goal skill with the extension.
