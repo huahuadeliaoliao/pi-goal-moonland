@@ -31,6 +31,9 @@ by slice, across as many runs as it takes. The loop ends only when the agent mar
 
 ## Install
 
+Requires **pi ≥ 0.87** — the continuation loop runs on pi's actionable
+`agent_before_settle` boundary; older hosts get an error notification instead.
+
 ```sh
 pi install git:github.com/huahuadeliaoliao/pi-goal       # from git
 pi install npm:pi-goal-moonland                          # from npm

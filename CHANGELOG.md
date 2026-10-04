@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-04)
 
 - **Append-only goal context (no more goal-induced cache misses).** The per-call head reminder is gone; creating, cancelling or replacing a goal used to shift the whole conversation (measured: a 371k-token cache write on one create). Every goal message is now persistent and appended at the tail, kimi-code style:
   - a `goal-reminder` (goal-mode framing + audit rules) follows the objective when a user starts a goal, and is re-appended after compaction (status-aware for paused/blocked goals);

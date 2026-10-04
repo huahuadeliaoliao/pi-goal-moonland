@@ -1,6 +1,6 @@
 {
 	"name": "pi-goal-moonland",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Goal mode for the pi coding agent: one persistent objective, worked autonomously across turns until it is verifiably done.",
 	"type": "module",
 	"license": "MIT",
