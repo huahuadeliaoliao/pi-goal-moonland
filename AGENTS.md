@@ -4,7 +4,7 @@ Guidance for agents working in this repository.
 
 ## What this is
 
-`pi-goal` — goal mode for the pi coding agent, shipped as a pi extension (`index.ts`, no build step; pi loads TypeScript via jiti). A goal says what must become *true*; after each agent run ends with the goal still active, the extension queues a hidden continuation so the agent keeps working across runs until the model marks the goal complete/blocked via the `goal` tool.
+`pi-goal-moonland` — goal mode for the pi coding agent, shipped as a pi extension (`index.ts`, no build step; pi loads TypeScript via jiti). A goal says what must become *true*; after each agent run ends with the goal still active, the extension queues a hidden continuation so the agent keeps working across runs until the model marks the goal complete/blocked via the `goal` tool.
 
 Layout: `index.ts` (extension), `state.ts` (pure state module), `prompts.ts` (prompt templates), `skills/write-goal/` (bundled skill).
 

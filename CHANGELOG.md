@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Rename the GitHub repository and public branding to **pi-goal-moonland**, matching the existing npm package name. Update repository links, the logo and package metadata; `/goal` commands, the `goal` tool and saved session state are unchanged. Existing releases and tags are preserved.
+- Synchronize the lockfile's root version with the already published `0.2.0`; no dependency versions changed.
+
 ## 0.2.0 (2026-10-04)
 
 - **Append-only goal context (no more goal-induced cache misses).** The per-call head reminder is gone; creating, cancelling or replacing a goal used to shift the whole conversation (measured: a 371k-token cache write on one create). Every goal message is now persistent and appended at the tail, kimi-code style:

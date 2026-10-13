@@ -7,7 +7,11 @@
 	"author": "huahuadeliaoliao",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/huahuadeliaoliao/pi-goal.git"
+		"url": "git+https://github.com/huahuadeliaoliao/pi-goal-moonland.git"
+	},
+	"homepage": "https://github.com/huahuadeliaoliao/pi-goal-moonland#readme",
+	"bugs": {
+		"url": "https://github.com/huahuadeliaoliao/pi-goal-moonland/issues"
 	},
 	"keywords": [
 		"pi-package",
@@ -33,7 +37,7 @@
 		"skills": [
 			"./skills"
 		],
-		"image": "https://raw.githubusercontent.com/huahuadeliaoliao/pi-goal/main/docs/logo.png"
+		"image": "https://raw.githubusercontent.com/huahuadeliaoliao/pi-goal-moonland/main/docs/logo.png"
 	},
 	"scripts": {
 		"check": "tsc --noEmit",

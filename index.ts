@@ -527,7 +527,7 @@ export default function goalMode(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (event, ctx) => {
 		if (!hostSupportsBoundaries(VERSION)) {
-			ctx.ui.notify(`pi-goal needs pi >= 0.87 (found ${VERSION}); goal continuation will not run.`, "error");
+			ctx.ui.notify(`pi-goal-moonland needs pi >= 0.87 (found ${VERSION}); goal continuation will not run.`, "error");
 		}
 		restoreFromBranch(ctx, "session resumed");
 

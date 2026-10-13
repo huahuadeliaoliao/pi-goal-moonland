@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/logo.svg" width="640" alt="pi-goal — moon phases ending in a target">
+  <img src="https://raw.githubusercontent.com/huahuadeliaoliao/pi-goal-moonland/main/docs/logo.png" width="640" alt="pi-goal-moonland — moon phases ending in a target">
 </p>
 
-<h1 align="center">pi-goal</h1>
+<h1 align="center">pi-goal-moonland</h1>
 
 <p align="center">
   Goal mode for the <a href="https://github.com/earendil-works/pi">pi</a> coding agent:<br>
@@ -25,7 +25,7 @@ A normal prompt tells the agent what to do *next*. A goal says what must become 
 ```
 
 Once a goal is active, the agent keeps working. Each time a run ends with the goal still
-active, pi-goal queues a hidden continuation and the agent picks the work back up — slice
+active, pi-goal-moonland queues a hidden continuation and the agent picks the work back up — slice
 by slice, across as many runs as it takes. The loop ends only when the agent marks the goal
 `complete` (with evidence) or `blocked` (with a concrete reason), or when you stop it.
 
@@ -35,19 +35,22 @@ Requires **pi ≥ 0.87** — the continuation loop runs on pi's actionable
 `agent_before_settle` boundary; older hosts get an error notification instead.
 
 ```sh
-pi install git:github.com/huahuadeliaoliao/pi-goal       # from git
-pi install npm:pi-goal-moonland                          # from npm
+pi install git:github.com/huahuadeliaoliao/pi-goal-moonland  # from git
+pi install npm:pi-goal-moonland                             # from npm
 ```
 
-On npm the package is `pi-goal-moonland` — the bare `pi-goal` name was already taken.
+The project was previously called `pi-goal`; the npm package name is unchanged.
+Existing git installs can keep the old source URL through GitHub's redirect. Do not add
+the new git URL alongside the old one: Pi treats them as different package sources.
+The `/goal` commands, `goal` tool and saved goal state are unchanged.
 
-Or ad-hoc, without installing: `pi -e /path/to/pi-goal` (the directory or `index.ts` both work).
+Or ad-hoc, without installing: `pi -e /path/to/pi-goal-moonland` (the directory or `index.ts` both work).
 
 Manual copy still works too:
 
 ```sh
-git clone https://github.com/huahuadeliaoliao/pi-goal.git
-cp -r pi-goal ~/.pi/agent/extensions/goal
+git clone https://github.com/huahuadeliaoliao/pi-goal-moonland.git
+cp -r pi-goal-moonland ~/.pi/agent/extensions/goal
 ```
 
 ## Usage
@@ -75,7 +78,7 @@ Flags:
 Headless: `pi -p "/goal <objective>"` runs the goal to completion, then exits.
 
 **Security note:** a goal is an unattended loop that edits files and runs commands, and
-agent-created goals start immediately by default. If you run pi-goal against untrusted content
+agent-created goals start immediately by default. If you run pi-goal-moonland against untrusted content
 or simply want a human checkpoint, start pi with `--goal-confirm`.
 
 ## How it works

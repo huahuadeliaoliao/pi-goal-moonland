@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="640" height="120" viewBox="0 0 640 120" fill="none">
-  <title>pi-goal — moon phases ending in a target</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="120" viewBox="0 0 800 120" fill="none">
+  <title>pi-goal-moonland — moon phases ending in a target</title>
   <!-- moon phases (a nod to kimi-code's TUI moon loader), ending in a target -->
   <g stroke-linecap="round">
     <!-- new moon -->
@@ -26,6 +26,6 @@
     <circle cx="440" cy="60" r="20" fill="#fbbf24"/>
     <circle cx="440" cy="60" r="5" fill="#b45309"/>
     <!-- wordmark -->
-    <text x="500" y="70" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="26" font-weight="600" fill="#64748b">pi-goal</text>
+    <text x="500" y="70" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="26" font-weight="600" fill="#64748b">pi-goal-moonland</text>
   </g>
 </svg>
